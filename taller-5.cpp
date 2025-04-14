@@ -7,11 +7,19 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <iomanip>
 
 using namespace std;
 using namespace std::chrono;
 
 mutex mtx;
+atomic<int> totalThreads(0);
+atomic<int> activeThreads(0);
+
+// Función para obtener el número de cores disponibles
+unsigned int getNumCores() {
+    return thread::hardware_concurrency();
+}
 
 // Función para generar una matriz de costos aleatorios
 vector<vector<int>> generateCostMatrix(int n, int min_val = 1, int max_val = 10) {
@@ -67,12 +75,16 @@ void parallelBacktracking(const vector<vector<int>>& matrix, int current, int en
         if(matrix[current][i] != 0 && !visited[i]) {
             visited[i] = true;
             
-            // Paralelización en niveles superiores del árbol de recursión
-            if(depth < 2) { // Umbral de paralelización
+            // Paralelización optimizada basada en el número de cores
+            static const unsigned int numCores = getNumCores();
+            if(depth == 0 && i < numCores) { // Usamos todos los cores disponibles
+                totalThreads++;
+                activeThreads++;
                 thread t([&matrix, i, end, dist, &minDist, visited, depth, current]() mutable {
                     int localDist = dist + matrix[current][i];
                     vector<bool> localVisited = visited;
                     parallelBacktracking(matrix, i, end, localDist, minDist, localVisited, depth + 1);
+                    activeThreads--;
                 });
                 t.detach();
             } else {
@@ -94,8 +106,19 @@ long long measureTime(Func func) {
 }
 
 int main() {
+    // Definir el tamaño máximo de las matrices
+    const int MAX_SIZE = 20;
+    
+    cout << "Sistema detectado:" << endl;
+    cout << "Número de cores: " << getNumCores() << endl;
+    cout << "Tamaño máximo de matriz: " << MAX_SIZE << "x" << MAX_SIZE << endl;
+    cout << "----------------------------------------" << endl;
+    
     // Pruebas con diferentes tamaños de matriz
-    vector<int> sizes = {2, 3, 4, 5, 6, 7, 8, 9, 10};
+    vector<int> sizes;
+    for(int i = 2; i <= MAX_SIZE; i++) {
+        sizes.push_back(i);
+    }
     vector<long long> seqTimes, parTimes;
     
     for(int n : sizes) {
@@ -104,17 +127,19 @@ int main() {
         // Generar matriz de costos
         auto matrix = generateCostMatrix(n);
         
-        // Imprimir matriz (opcional para tamaños pequeños)
-        if(n <= 5) {
-            cout << "Matriz de costos:\n";
-            for(const auto& row : matrix) {
-                for(int val : row) cout << val << " ";
-                cout << endl;
-            }
+        // Imprimir matriz
+        cout << "Matriz de costos:\n";
+        for(const auto& row : matrix) {
+            for(int val : row) cout << setw(3) << val << " ";
+            cout << endl;
         }
         
         int start = 0;
         int end = n - 1;
+        
+        // Resetear contadores
+        totalThreads = 0;
+        activeThreads = 0;
         
         // Ejecución secuencial
         int seqMinDist = numeric_limits<int>::max();
@@ -125,8 +150,9 @@ int main() {
             sequentialBacktracking(matrix, start, end, 0, seqMinDist, seqVisited);
         });
         
-        cout << "Secuencial - Distancia minima: " << seqMinDist 
-             << ", Tiempo: " << seqTime << " ms\n";
+        cout << "\nSecuencial:" << endl;
+        cout << "  - Distancia minima: " << seqMinDist << endl;
+        cout << "  - Tiempo: " << seqTime << " ms" << endl;
         seqTimes.push_back(seqTime);
         
         // Ejecución paralela
@@ -138,26 +164,35 @@ int main() {
             parallelBacktracking(matrix, start, end, 0, parMinDist, parVisited);
             
             // Esperar a que todos los hilos terminen
-            this_thread::sleep_for(milliseconds(100 * n)); // Ajuste empírico
+            while(activeThreads > 0) {
+                this_thread::sleep_for(milliseconds(100));
+            }
         });
         
-        cout << "Paralelo   - Distancia minima: " << parMinDist.load()
-             << ", Tiempo: " << parTime << " ms\n";
+        cout << "\nParalelo:" << endl;
+        cout << "  - Distancia minima: " << parMinDist.load() << endl;
+        cout << "  - Tiempo: " << parTime << " ms" << endl;
+        cout << "  - Threads creados: " << totalThreads << endl;
+        cout << "  - Threads activos máximos: " << getNumCores() << endl;
         parTimes.push_back(parTime);
         
         // Calcular speedup
         if(seqTime > 0 && parTime > 0) {
             double speedup = static_cast<double>(seqTime) / parTime;
-            cout << "Speedup: " << speedup << "x\n";
+            cout << "  - Speedup: " << fixed << setprecision(2) << speedup << "x" << endl;
         }
+        
+        cout << "----------------------------------------" << endl;
     }
     
     // Mostrar resumen de resultados
     cout << "\nResumen de tiempos:\n";
-    cout << "Tamaño\tSecuencial(ms)\tParalelo(ms)\n";
+    cout << setw(8) << "Tamaño" << setw(15) << "Secuencial(ms)" << setw(15) << "Paralelo(ms)" << setw(15) << "Speedup" << endl;
     for(size_t i = 0; i < sizes.size(); i++) {
-        cout << sizes[i] << "x" << sizes[i] << "\t" 
-             << seqTimes[i] << "\t\t" << parTimes[i] << "\n";
+        double speedup = (seqTimes[i] > 0 && parTimes[i] > 0) ? 
+                        static_cast<double>(seqTimes[i]) / parTimes[i] : 0.0;
+        cout << setw(4) << sizes[i] << "x" << sizes[i] << setw(15) << seqTimes[i] 
+             << setw(15) << parTimes[i] << setw(15) << fixed << setprecision(2) << speedup << endl;
     }
     
     return 0;

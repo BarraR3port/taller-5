@@ -23,7 +23,7 @@ Este proyecto implementa una solución paralela para el problema del camino más
 ## Descripción del Programa
 
 El programa realiza las siguientes operaciones:
-- Genera matrices de costos aleatorias de diferentes tamaños (2x2 hasta 10x10)
+- Genera matrices de costos aleatorias de diferentes tamaños (desde 2x2 hasta 14x14)
 - Resuelve el problema del camino más corto usando dos enfoques:
   - Backtracking secuencial
   - Backtracking paralelo
@@ -43,4 +43,5 @@ El programa mostrará:
 
 - Para matrices pequeñas (hasta 8x8), el tiempo secuencial puede mostrar 0ms debido a la alta velocidad de ejecución
 - La versión paralela tiene un overhead significativo debido a la creación de threads
-- Los resultados pueden variar entre ejecuciones debido a la naturaleza aleatoria de las matrices generadas 
+- Los resultados pueden variar entre ejecuciones debido a la naturaleza aleatoria de las matrices generadas
+- El tamaño máximo de las matrices se puede ajustar modificando la constante MAX_SIZE en el código fuente 
