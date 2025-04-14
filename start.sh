@@ -2,7 +2,7 @@
 
 # Compile the program
 echo "Compiling program..."
-g++ -std=c++11 -pthread taller-5.cpp -o taller-5
+g++ -std=c++17 -pthread taller-5.cpp -o taller-5
 
 # Check if compilation was successful
 if [ $? -eq 0 ]; then

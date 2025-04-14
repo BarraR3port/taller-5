@@ -8,13 +8,162 @@
 #include <mutex>
 #include <atomic>
 #include <iomanip>
+#include <queue>
+#include <condition_variable>
+#include <sstream>
 
 using namespace std;
 using namespace std::chrono;
 
-mutex mtx;
+// Clase para el pool de threads
+class ThreadPool {
+private:
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    mutex queue_mutex;
+    condition_variable condition;
+    bool stop;
+    atomic<int> active_tasks;
+    atomic<int> total_tasks;
+    atomic<chrono::high_resolution_clock::time_point> start_time;
+    atomic<chrono::high_resolution_clock::time_point> end_time;
+
+public:
+    ThreadPool(size_t threads) : stop(false), active_tasks(0), total_tasks(0) {
+        for(size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while(true) {
+                    function<void()> task;
+                    {
+                        unique_lock<mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] { 
+                            return stop || !tasks.empty(); 
+                        });
+                        if(stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                        active_tasks++;
+                    }
+                    task();
+                    active_tasks--;
+                    total_tasks--;
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            if(stop) throw runtime_error("enqueue on stopped ThreadPool");
+            tasks.emplace(std::forward<F>(f));
+            total_tasks++;
+        }
+        condition.notify_one();
+    }
+
+    void startTimer() {
+        start_time.store(chrono::high_resolution_clock::now());
+    }
+
+    void stopTimer() {
+        end_time.store(chrono::high_resolution_clock::now());
+    }
+
+    double getElapsedTime() {
+        return chrono::duration_cast<chrono::nanoseconds>(
+            end_time.load() - start_time.load()
+        ).count();
+    }
+
+    void waitForCompletion() {
+        while(total_tasks > 0 || active_tasks > 0) {
+            this_thread::sleep_for(microseconds(100));
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(thread &worker: workers) {
+            worker.join();
+        }
+    }
+};
+
+// Variables globales
 atomic<int> totalThreads(0);
-atomic<int> activeThreads(0);
+atomic<int> prunedPaths(0);
+atomic<int> totalCells(0);
+atomic<int> visitedCells(0);
+atomic<int> currentRow(0);
+atomic<int> currentCol(0);
+atomic<int> currentDistance(0);
+atomic<int> currentDepth(0);
+atomic<int> bestDistanceFound(numeric_limits<int>::max());
+atomic<chrono::steady_clock::time_point> searchStartTime;
+mutex progressMutex;
+atomic<chrono::steady_clock::time_point> lastUpdate;
+
+// Function to display search status
+void showSearchStatus(int row, int col, int currentDist, int depth, int bestDist, bool isParallel, int matrixSize) {
+    static const auto minUpdateInterval = chrono::milliseconds(100);
+    auto now = chrono::steady_clock::now();
+    auto last = lastUpdate.load();
+    
+    if (now - last < minUpdateInterval) {
+        return;
+    }
+    
+    lock_guard<mutex> lock(progressMutex);
+    lastUpdate.store(now);
+    
+    auto elapsedTime = chrono::duration_cast<chrono::nanoseconds>(now - searchStartTime.load()).count();
+    string timeStr;
+    
+    if (elapsedTime < 1000) {
+        timeStr = to_string(elapsedTime) + " ns";
+    } else if (elapsedTime < 1000000) {
+        timeStr = to_string(elapsedTime / 1000) + " µs";
+    } else if (elapsedTime < 1000000000) {
+        timeStr = to_string(elapsedTime / 1000000) + " ms";
+    } else {
+        double seconds = static_cast<double>(elapsedTime) / 1000000000.0;
+        int hours = static_cast<int>(seconds / 3600);
+        int minutes = static_cast<int>((seconds - hours * 3600) / 60);
+        double remainingSeconds = seconds - hours * 3600 - minutes * 60;
+        
+        stringstream ss;
+        if (hours > 0) {
+            ss << hours << "h " << minutes << "m " << fixed << setprecision(3) << remainingSeconds << "s";
+        } else if (minutes > 0) {
+            ss << minutes << "m " << fixed << setprecision(3) << remainingSeconds << "s";
+        } else {
+            ss << fixed << setprecision(3) << seconds << "s";
+        }
+        timeStr = ss.str();
+    }
+    
+    // Función para formatear números con ceros a la izquierda
+    auto formatNumber = [](int num) -> string {
+        if (num < 10) return "0" + to_string(num);
+        return to_string(num);
+    };
+    
+    cout << "\r\033[K"; // Limpiar la línea
+    cout << "[" << formatNumber(matrixSize) << "x" << formatNumber(matrixSize) << "] "
+         << "Estado de búsqueda " << (isParallel ? "[PARALELO]" : "[SECUENCIAL]") << ": "
+         << "[" << formatNumber(row) << "," << formatNumber(col) << "] "
+         << "Nivel: " << formatNumber(depth) << " | "
+         << "Dist actual: " << formatNumber(currentDist) << " | "
+         << "Mejor dist: " << formatNumber(bestDist) << " | "
+         << "Podados: " << formatNumber(prunedPaths.load()) << " | "
+         << "Tiempo: " << timeStr << flush;
+}
 
 // Función para obtener el número de cores disponibles
 unsigned int getNumCores() {
@@ -40,55 +189,77 @@ vector<vector<int>> generateCostMatrix(int n, int min_val = 1, int max_val = 10)
     return matrix;
 }
 
+// Función para calcular el número total de caminos posibles
+int calculateTotalPaths(int n) {
+    if (n <= 1) return 1;
+    int total = 1;
+    for(int i = 1; i < n; i++) {
+        total *= i;
+    }
+    return total;
+}
+
 // Función de backtracking secuencial
 void sequentialBacktracking(const vector<vector<int>>& matrix, int current, int end, 
-                           int dist, int& minDist, vector<bool>& visited) {
+                           int dist, int& minDist, vector<bool>& visited, int depth = 0) {
     if(current == end) {
         minDist = min(minDist, dist);
+        bestDistanceFound.store(minDist);
         return;
     }
     
     for(int i = 0; i < matrix.size(); i++) {
         if(matrix[current][i] != 0 && !visited[i]) {
             visited[i] = true;
-            sequentialBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited);
+            visitedCells++;
+            currentRow.store(current);
+            currentCol.store(i);
+            currentDistance.store(dist + matrix[current][i]);
+            currentDepth.store(depth);
+            showSearchStatus(current, i, dist + matrix[current][i], depth, bestDistanceFound.load(), false, matrix.size());
+            sequentialBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited, depth + 1);
             visited[i] = false;
         }
     }
 }
 
-// Función de backtracking paralelo (versión con mutex)
+// Función de backtracking paralelo optimizada
 void parallelBacktracking(const vector<vector<int>>& matrix, int current, int end, 
                          int dist, atomic<int>& minDist, vector<bool>& visited, 
-                         int depth = 0) {
+                         ThreadPool& pool, int depth = 0) {
+    if(dist >= minDist.load()) {
+        prunedPaths++;
+        return;
+    }
+
     if(current == end) {
-        // Actualización atómica del mínimo
         int currentMin = minDist.load();
         while(dist < currentMin && !minDist.compare_exchange_weak(currentMin, dist)) {
             currentMin = minDist.load();
         }
+        bestDistanceFound.store(currentMin);
         return;
     }
     
-    // Explorar todos los posibles caminos
     for(int i = 0; i < matrix.size(); i++) {
         if(matrix[current][i] != 0 && !visited[i]) {
             visited[i] = true;
+            visitedCells++;
+            currentRow.store(current);
+            currentCol.store(i);
+            currentDistance.store(dist + matrix[current][i]);
+            currentDepth.store(depth);
+            showSearchStatus(current, i, dist + matrix[current][i], depth, bestDistanceFound.load(), true, matrix.size());
             
-            // Paralelización optimizada basada en el número de cores
-            static const unsigned int numCores = getNumCores();
-            if(depth == 0 && i < numCores) { // Usamos todos los cores disponibles
+            if(depth == 0) {
                 totalThreads++;
-                activeThreads++;
-                thread t([&matrix, i, end, dist, &minDist, visited, depth, current]() mutable {
+                pool.enqueue([&matrix, i, end, dist, &minDist, visited, depth, current, &pool]() mutable {
                     int localDist = dist + matrix[current][i];
                     vector<bool> localVisited = visited;
-                    parallelBacktracking(matrix, i, end, localDist, minDist, localVisited, depth + 1);
-                    activeThreads--;
+                    parallelBacktracking(matrix, i, end, localDist, minDist, localVisited, pool, depth + 1);
                 });
-                t.detach();
             } else {
-                parallelBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited, depth + 1);
+                parallelBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited, pool, depth + 1);
             }
             
             visited[i] = false;
@@ -96,103 +267,126 @@ void parallelBacktracking(const vector<vector<int>>& matrix, int current, int en
     }
 }
 
-// Función para medir el tiempo de ejecución
+// Función para formatear el tiempo en una unidad apropiada
+string formatTime(double nanoseconds) {
+    if (nanoseconds < 1000.0) {
+        return to_string(static_cast<int>(round(nanoseconds))) + " ns";
+    } else if (nanoseconds < 1000000.0) {
+        return to_string(static_cast<int>(round(nanoseconds / 1000.0))) + " µs";
+    } else if (nanoseconds < 1000000000.0) {
+        return to_string(static_cast<int>(round(nanoseconds / 1000000.0))) + " ms";
+    } else {
+        double seconds = nanoseconds / 1000000000.0;
+        int hours = static_cast<int>(seconds / 3600);
+        int minutes = static_cast<int>((seconds - hours * 3600) / 60);
+        double remainingSeconds = seconds - hours * 3600 - minutes * 60;
+        
+        stringstream ss;
+        if (hours > 0) {
+            ss << hours << "h " << minutes << "m " << fixed << setprecision(3) << remainingSeconds << "s";
+        } else if (minutes > 0) {
+            ss << minutes << "m " << fixed << setprecision(3) << remainingSeconds << "s";
+        } else {
+            ss << fixed << setprecision(3) << seconds << "s";
+        }
+        return ss.str();
+    }
+}
+
+// Función mejorada para medir el tiempo
 template<typename Func>
-long long measureTime(Func func) {
+double measureTime(Func func) {
     auto start = high_resolution_clock::now();
     func();
     auto stop = high_resolution_clock::now();
-    return duration_cast<milliseconds>(stop - start).count();
+    return duration_cast<nanoseconds>(stop - start).count();
 }
 
 int main() {
-    // Definir el tamaño máximo de las matrices
-    const int MAX_SIZE = 20;
+    const int MAX_SIZE = 500;
     
     cout << "Sistema detectado:" << endl;
     cout << "Número de cores: " << getNumCores() << endl;
     cout << "Tamaño máximo de matriz: " << MAX_SIZE << "x" << MAX_SIZE << endl;
     cout << "----------------------------------------" << endl;
     
-    // Pruebas con diferentes tamaños de matriz
+    ThreadPool pool(getNumCores());
+    
     vector<int> sizes;
     for(int i = 2; i <= MAX_SIZE; i++) {
         sizes.push_back(i);
     }
-    vector<long long> seqTimes, parTimes;
     
     for(int n : sizes) {
         cout << "\nProbando matriz de " << n << "x" << n << ":\n";
         
-        // Generar matriz de costos
         auto matrix = generateCostMatrix(n);
         
-        // Imprimir matriz
-        cout << "Matriz de costos:\n";
-        for(const auto& row : matrix) {
-            for(int val : row) cout << setw(3) << val << " ";
-            cout << endl;
-        }
+        // cout << "Matriz de costos:\n";
+        // for(const auto& row : matrix) {
+        //     for(int val : row) cout << setw(3) << val << " ";
+        //     cout << endl;
+        // }
         
         int start = 0;
         int end = n - 1;
         
-        // Resetear contadores
         totalThreads = 0;
-        activeThreads = 0;
+        prunedPaths = 0;
+        totalCells = calculateTotalPaths(n);
+        visitedCells = 0;
+        lastUpdate.store(chrono::steady_clock::now());
         
-        // Ejecución secuencial
-        int seqMinDist = numeric_limits<int>::max();
+        // Sequential execution
+        cout << "\nProcesando secuencial: ";
+        cout.flush();
+        int seqResult = numeric_limits<int>::max();
         vector<bool> seqVisited(n, false);
         seqVisited[start] = true;
+        bestDistanceFound.store(numeric_limits<int>::max());
+        searchStartTime.store(chrono::steady_clock::now());
         
-        auto seqTime = measureTime([&]() {
-            sequentialBacktracking(matrix, start, end, 0, seqMinDist, seqVisited);
-        });
+        auto seqStart = chrono::high_resolution_clock::now();
+        sequentialBacktracking(matrix, start, end, 0, seqResult, seqVisited);
+        auto seqEnd = chrono::high_resolution_clock::now();
+        double seqTimeNanos = chrono::duration_cast<chrono::nanoseconds>(seqEnd - seqStart).count();
         
         cout << "\nSecuencial:" << endl;
-        cout << "  - Distancia minima: " << seqMinDist << endl;
-        cout << "  - Tiempo: " << seqTime << " ms" << endl;
-        seqTimes.push_back(seqTime);
+        cout << "  - Distancia minima: " << seqResult << endl;
+        cout << "  - Tiempo: " << formatTime(seqTimeNanos) << endl;
         
-        // Ejecución paralela
-        atomic<int> parMinDist(numeric_limits<int>::max());
+        // Parallel execution
+        cout << "\nProcesando paralelo: ";
+        cout.flush();
+        atomic<int> parResult(numeric_limits<int>::max());
         vector<bool> parVisited(n, false);
         parVisited[start] = true;
+        visitedCells = 0;
+        prunedPaths = 0;
+        bestDistanceFound.store(numeric_limits<int>::max());
+        searchStartTime.store(chrono::steady_clock::now());
         
-        auto parTime = measureTime([&]() {
-            parallelBacktracking(matrix, start, end, 0, parMinDist, parVisited);
-            
-            // Esperar a que todos los hilos terminen
-            while(activeThreads > 0) {
-                this_thread::sleep_for(milliseconds(100));
-            }
-        });
+        auto parStart = chrono::high_resolution_clock::now();
+        parallelBacktracking(matrix, start, end, 0, parResult, parVisited, pool);
+        pool.waitForCompletion();
+        auto parEnd = chrono::high_resolution_clock::now();
+        double parTimeNanos = chrono::duration_cast<chrono::nanoseconds>(parEnd - parStart).count();
         
-        cout << "\nParalelo:" << endl;
-        cout << "  - Distancia minima: " << parMinDist.load() << endl;
-        cout << "  - Tiempo: " << parTime << " ms" << endl;
-        cout << "  - Threads creados: " << totalThreads << endl;
-        cout << "  - Threads activos máximos: " << getNumCores() << endl;
-        parTimes.push_back(parTime);
-        
-        // Calcular speedup
-        if(seqTime > 0 && parTime > 0) {
-            double speedup = static_cast<double>(seqTime) / parTime;
-            cout << "  - Speedup: " << fixed << setprecision(2) << speedup << "x" << endl;
+        // Calculate speedup only for matrices larger than 5x5
+        double speedup = 0.0;
+        if (seqTimeNanos > 0 && parTimeNanos > 0 && n > 5) {
+            speedup = seqTimeNanos / parTimeNanos;
         }
         
+        cout << "\nParalelo:" << endl;
+        cout << "  - Distancia minima: " << parResult.load() << endl;
+        cout << "  - Tiempo: " << formatTime(parTimeNanos) << endl;
+        cout << "  - Threads creados: " << totalThreads.load() << endl;
+        cout << "  - Caminos podados: " << prunedPaths.load() << endl;
+        cout << "  - Threads activos máximos: " << getNumCores() << endl;
+        cout << "  - Speedup: " << fixed << setprecision(2) << speedup << "x" << endl;
+        
         cout << "----------------------------------------" << endl;
-    }
-    
-    // Mostrar resumen de resultados
-    cout << "\nResumen de tiempos:\n";
-    cout << setw(8) << "Tamaño" << setw(15) << "Secuencial(ms)" << setw(15) << "Paralelo(ms)" << setw(15) << "Speedup" << endl;
-    for(size_t i = 0; i < sizes.size(); i++) {
-        double speedup = (seqTimes[i] > 0 && parTimes[i] > 0) ? 
-                        static_cast<double>(seqTimes[i]) / parTimes[i] : 0.0;
-        cout << setw(4) << sizes[i] << "x" << sizes[i] << setw(15) << seqTimes[i] 
-             << setw(15) << parTimes[i] << setw(15) << fixed << setprecision(2) << speedup << endl;
     }
     
     return 0;
