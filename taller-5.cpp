@@ -73,14 +73,14 @@ void showSearchStatus(int row, int col, int currentDist, int depth, int bestDist
     
     stringstream status;
     status << "[" << formatNumber(matrixSize) << "x" << formatNumber(matrixSize) << "]"
+           << "[t:" << timeStr << "]"
            << " Estado: " << (isParallel ? "[PARALELO]" : "[SECUENCIAL]") << ": "
            << "[" << formatNumber(row) << "," << formatNumber(col) << "] "
            << "Nivel: " << formatNumber(depth) << " | "
            << "Actual: " << formatNumber(currentDist) << " | "
            << "Mejor: " << (bestDist == numeric_limits<int>::max() ? "---" : formatNumber(bestDist)) << " | "
-           << "Podados: " << formatNumber(prunedPaths.load()) << " | "
-           << "Tiempo: " << timeStr;
-    
+           << "Podados: " << formatNumber(prunedPaths.load());
+
     if (isParallel) {
         lastParallelStatus = status.str();
     } else {
@@ -125,30 +125,32 @@ int calculateTotalPaths(int n) {
     return total;
 }
 
-// Función de backtracking secuencial
-void sequentialBacktracking(const vector<vector<int>>& matrix, int current, int end,
-                           int dist, int& minDist, vector<bool>& visited, int depth = 0) {
-    if (dist >= bestDistanceFound.load()) {
-        prunedPaths++;
-        return;
-    }
-
-    if(current == end) {
-        if (dist < minDist) {
-            minDist = dist;
-            bestDistanceFound.store(minDist);
+// Function to display the cost matrix
+void displayMatrix(const vector<vector<int>>& matrix) {
+    cout << "\nMatriz de costos:\n";
+    for(const auto& row : matrix) {
+        for(int val : row) {
+            cout << setw(3) << val << " ";
         }
+        cout << endl;
+    }
+    cout << endl;
+}
+
+// Función de backtracking secuencial
+void sequentialBacktracking(const vector<vector<int>>& matrix, int current, int end, 
+                           int dist, int& minDist, vector<bool>& visited) {
+    if(current == end) {
+        minDist = min(minDist, dist);
+        bestDistanceFound.store(minDist);
         return;
     }
-
-    showSearchStatus(current, -1, dist, depth, bestDistanceFound.load(), false, matrix.size());
-
+    showSearchStatus(current, -1, dist, 0, bestDistanceFound.load(), false, matrix.size());
     for(int i = 0; i < matrix.size(); i++) {
         if(matrix[current][i] != 0 && !visited[i]) {
             visited[i] = true;
-            visitedCells++;
-            showSearchStatus(current, i, dist + matrix[current][i], depth + 1, bestDistanceFound.load(), false, matrix.size());
-            sequentialBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited, depth + 1);
+            showSearchStatus(current, i, dist + matrix[current][i], 1, bestDistanceFound.load(), false, matrix.size());
+            sequentialBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited);
             visited[i] = false;
         }
     }
@@ -268,6 +270,9 @@ int main() {
         cout << "\n" << BOLD << "Probando matriz de " << n << "x" << n << ":" << RESET << "\n";
         
         auto matrix = generateCostMatrix(n);
+        
+        // Display matrix for small sizes
+        displayMatrix(matrix);
         
         int start = 0;
         int end = n - 1;
