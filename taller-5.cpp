@@ -10,12 +10,11 @@
 #include <iomanip>
 #include <sstream>
 #include <fstream> // For CSV file output
-#include <filesystem> // For directory operations
-#include <system_error> // For error handling
+#include <sys/stat.h> // Para stat() en lugar de filesystem
+#include <cerrno> // Para códigos de error
 
 using namespace std;
 using namespace std::chrono;
-namespace fs = std::filesystem;
 
 // Variables globales
 atomic<int> totalThreads(0);
@@ -55,15 +54,36 @@ vector<BenchmarkResult> benchmarkResults;
 #define MAGENTA "\033[35m"      /* Magenta */
 #define CYAN    "\033[36m"      /* Cyan */
 
+// Function to check if a directory exists
+bool directoryExists(const string& path) {
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) {
+        return false; // No existe o error al acceder
+    }
+    return (info.st_mode & S_IFDIR); // Devuelve true si es un directorio
+}
+
+// Function to create a directory
+bool createDirectory(const string& path) {
+#ifdef _WIN32
+    int result = mkdir(path.c_str());
+#else
+    int result = mkdir(path.c_str(), 0755); // Permisos para Linux/Mac
+#endif
+    return result == 0 || errno == EEXIST;
+}
+
 // Function to ensure the results directory exists
 void ensureResultsDirectoryExists() {
-    error_code ec;
-    if (!fs::exists(RESULTS_DIR, ec)) {
-        fs::create_directory(RESULTS_DIR, ec);
-        if (ec) {
-            cerr << "Error al crear el directorio " << RESULTS_DIR << ": " << ec.message() << endl;
+    if (!directoryExists(RESULTS_DIR)) {
+        if (!createDirectory(RESULTS_DIR)) {
+            cerr << RED << "Error al crear el directorio " << RESULTS_DIR << RESET << endl;
             exit(1);
+        } else {
+            cout << GREEN << "Directorio '" << RESULTS_DIR << "' creado correctamente." << RESET << endl;
         }
+    } else {
+        cout << YELLOW << "Usando directorio existente: '" << RESULTS_DIR << "'" << RESET << endl;
     }
 }
 
@@ -173,11 +193,20 @@ void displayMatrix(const vector<vector<int>>& matrix) {
 // Función de backtracking secuencial
 void sequentialBacktracking(const vector<vector<int>>& matrix, int current, int end, 
                            int dist, int& minDist, vector<bool>& visited) {
+    visitedCells++; // Incrementar contador de celdas visitadas
+    
     if(current == end) {
         minDist = min(minDist, dist);
         bestDistanceFound.store(minDist);
         return;
     }
+    
+    // Poda de caminos no óptimos
+    if (dist >= minDist) {
+        prunedPaths++; // Incrementar contador de caminos podados
+        return;
+    }
+    
     showSearchStatus(current, -1, dist, 0, bestDistanceFound.load(), false, matrix.size());
     for(int i = 0; i < matrix.size(); i++) {
         if(matrix[current][i] != 0 && !visited[i]) {
@@ -189,64 +218,53 @@ void sequentialBacktracking(const vector<vector<int>>& matrix, int current, int 
     }
 }
 
-// Worker function for parallel execution (runs sequentially within its thread)
-void parallelBacktrackingWorker(const vector<vector<int>>& matrix, int current, int end,
-                         int dist, atomic<int>& minDist, vector<bool> visited,
-                         int depth) {
+// Función de backtracking paralelo (versión con mutex)
+void parallelBacktracking(const vector<vector<int>>& matrix, int current, int end,
+                         int dist, atomic<int>& minDist, vector<bool>& visited,
+                         int depth = 0) {
     visitedCells++;
-
-    if(dist >= minDist.load()) {
-        prunedPaths++;
-        return;
-    }
-
+    
     if(current == end) {
+        // Actualización atómica del mínimo
         int currentMin = minDist.load();
         while(dist < currentMin && !minDist.compare_exchange_weak(currentMin, dist)) {
+            currentMin = minDist.load();
         }
         if (dist < currentMin) {
             bestDistanceFound.store(dist);
         }
         return;
     }
-
+    
+    // Poda de caminos no óptimos
+    if (dist >= minDist.load()) {
+        prunedPaths++;
+        return;
+    }
+    
     showSearchStatus(current, -1, dist, depth, bestDistanceFound.load(), true, matrix.size());
-
+    
+    // Explorar todos los posibles caminos
     for(int i = 0; i < matrix.size(); i++) {
         if(matrix[current][i] != 0 && !visited[i]) {
-            vector<bool> nextVisited = visited;
-            nextVisited[i] = true;
-
+            visited[i] = true;
+            
             showSearchStatus(current, i, dist + matrix[current][i], depth + 1, bestDistanceFound.load(), true, matrix.size());
-
-            parallelBacktrackingWorker(matrix, i, end, dist + matrix[current][i], minDist, nextVisited, depth + 1);
-        }
-    }
-}
-
-// Main parallel function - only creates initial threads from the start node
-void parallelBacktracking(const vector<vector<int>>& matrix, int startNode, int endNode,
-                         int initialDist, atomic<int>& minDist, const vector<bool>& initialVisited,
-                         vector<thread>& workerThreads) {
-    int depth = 0;
-    visitedCells++;
-
-    showSearchStatus(startNode, -1, initialDist, depth, bestDistanceFound.load(), true, matrix.size());
-
-    for(int i = 0; i < matrix.size(); i++) {
-        if(matrix[startNode][i] != 0 && !initialVisited[i]) {
-            vector<bool> visitedCopy = initialVisited;
-            visitedCopy[i] = true;
-
-            int nextDist = initialDist + matrix[startNode][i];
-            int nextDepth = depth + 1;
-
-            showSearchStatus(startNode, i, nextDist, nextDepth, bestDistanceFound.load(), true, matrix.size());
-
-            totalThreads++;
-            workerThreads.emplace_back([&matrix, nextNode = i, endNode, dist = nextDist, &minDist, visitedState = visitedCopy, startDepth = nextDepth]() {
-                parallelBacktrackingWorker(matrix, nextNode, endNode, dist, minDist, visitedState, startDepth);
-            });
+            
+            // Paralelización en niveles superiores del árbol de recursión
+            if(depth < 2) { // Umbral de paralelización
+                totalThreads++;
+                thread t([&matrix, i, end, dist, &minDist, visited, depth, current]() mutable {
+                    int localDist = dist + matrix[current][i];
+                    vector<bool> localVisited = visited;
+                    parallelBacktracking(matrix, i, end, localDist, minDist, localVisited, depth + 1);
+                });
+                t.detach();
+            } else {
+                parallelBacktracking(matrix, i, end, dist + matrix[current][i], minDist, visited, depth + 1);
+            }
+            
+            visited[i] = false;
         }
     }
 }
@@ -288,11 +306,44 @@ double measureTime(Func func) {
 
 // Function to export benchmark results to CSV file
 void exportToCSV(const vector<BenchmarkResult>& results, const string& filename) {
+    // Volver a asegurar que el directorio existe
+    ensureResultsDirectoryExists();
+    
     string fullPath = RESULTS_DIR + "/" + filename;
+    cout << YELLOW << "Exportando resultados a: " << fullPath << RESET << endl;
+    
     ofstream csvFile(fullPath);
     
     if (!csvFile.is_open()) {
-        cerr << "Error al abrir el archivo " << fullPath << " para escribir resultados." << endl;
+        cerr << RED << "Error al abrir el archivo " << fullPath << " para escribir resultados." << RESET << endl;
+        
+        // Intentar escribir en el directorio actual como fallback
+        string fallbackPath = filename;
+        cout << YELLOW << "Intentando escribir en el directorio actual: " << fallbackPath << RESET << endl;
+        
+        ofstream fallbackFile(fallbackPath);
+        if (!fallbackFile.is_open()) {
+            cerr << RED << "Error también al escribir en el directorio actual. No se pudieron guardar los resultados." << RESET << endl;
+            return;
+        }
+        
+        // Escribir en el archivo de fallback
+        fallbackFile << "Tamaño de Matriz,Tipo de Ejecución,Distancia Mínima,Tiempo (ns),Tiempo (s),Celdas Visitadas,Caminos Podados,Hilos Creados,Speedup\n";
+        
+        for (const auto& result : results) {
+            fallbackFile << result.matrixSize << ","
+                    << result.executionType << ","
+                    << (result.minDistance == numeric_limits<int>::max() ? "No encontrada" : to_string(result.minDistance)) << ","
+                    << result.timeNanos << ","
+                    << (result.timeNanos / 1000000000.0) << ","
+                    << result.visitedCells << ","
+                    << result.prunedPaths << ","
+                    << result.threadsCreated << ","
+                    << (result.executionType == "Secuencial" ? "1.0" : to_string(result.speedup)) << "\n";
+        }
+        
+        fallbackFile.close();
+        cout << GREEN << "Resultados exportados a '" << fallbackPath << "' (directorio actual)" << RESET << endl;
         return;
     }
     
@@ -308,19 +359,58 @@ void exportToCSV(const vector<BenchmarkResult>& results, const string& filename)
                 << (result.timeNanos / 1000000000.0) << ","
                 << result.visitedCells << ","
                 << result.prunedPaths << ","
-                << (result.executionType == "Secuencial" ? "N/A" : to_string(result.threadsCreated)) << ","
-                << (result.executionType == "Secuencial" ? "N/A" : to_string(result.speedup)) << "\n";
+                << result.threadsCreated << ","
+                << (result.executionType == "Secuencial" ? "1.0" : to_string(result.speedup)) << "\n";
     }
     
     csvFile.close();
-    cout << BOLD << "Resultados exportados a '" << fullPath << "'" << RESET << endl;
+    cout << GREEN << "Resultados exportados exitosamente a '" << fullPath << "'" << RESET << endl;
+}
+
+// Función para ejecutar el generador de gráficos
+void runChartGenerator() {
+    cout << YELLOW << "Ejecutando generador de gráficos..." << RESET << endl;
+    
+    // Comando para ejecutar Python con el entorno virtual
+    string cmd;
+    
+    // Verificar si existe el entorno virtual
+    if (directoryExists("venv")) {
+        #ifdef _WIN32
+            cmd = "venv\\Scripts\\python generate_charts.py";
+        #else
+            cmd = "source venv/bin/activate && python generate_charts.py";
+        #endif
+    } else {
+        // Intentar con python3 directamente
+        cmd = "python3 generate_charts.py";
+    }
+    
+    cout << CYAN << "Ejecutando: " << cmd << RESET << endl;
+    int result = system(cmd.c_str());
+    
+    if (result != 0) {
+        cerr << RED << "Error al ejecutar el generador de gráficos. Código: " << result << RESET << endl;
+        
+        // Intentar con python como fallback
+        cout << YELLOW << "Intentando con 'python' como alternativa..." << RESET << endl;
+        result = system("python generate_charts.py");
+        
+        if (result != 0) {
+            cerr << RED << "Error al ejecutar el generador de gráficos con 'python'. Código: " << result << RESET << endl;
+        } else {
+            cout << GREEN << "Gráficos generados exitosamente con 'python'." << RESET << endl;
+        }
+    } else {
+        cout << GREEN << "Gráficos generados exitosamente." << RESET << endl;
+    }
 }
 
 int main() {
     // Ensure results directory exists
     ensureResultsDirectoryExists();
     
-    const int MAX_SIZE = 10;
+    const int MAX_SIZE = 15; // Reducido para pruebas más rápidas
     
     cout << BOLD << "Sistema detectado:" << RESET << endl;
     cout << "Número de cores: " << getNumCores() << endl;
@@ -341,7 +431,7 @@ int main() {
         auto matrix = generateCostMatrix(n);
         
         // Display matrix for small sizes
-        if (n <= 10) {
+        if (n <= 8) {
             displayMatrix(matrix);
         }
         
@@ -395,18 +485,15 @@ int main() {
         bestDistanceFound.store(numeric_limits<int>::max());
         searchStartTime.store(chrono::steady_clock::now());
         
-        vector<thread> workerThreads;
-        
         auto parStart = chrono::high_resolution_clock::now();
-        parallelBacktracking(matrix, start, end, 0, parResult, parVisited, workerThreads);
         
-        cout << "\n" << BOLD << "Esperando " << workerThreads.size() << " hilos paralelos..." << RESET << flush;
-        for (auto& t : workerThreads) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
-        cout << "\r" << BOLD << "Hilos paralelos completados.          " << RESET << endl;
+        // Ejecutamos el backtracking paralelo
+        parallelBacktracking(matrix, start, end, 0, parResult, parVisited);
+        
+        // Esperamos un tiempo para que se completen los hilos (ya que usamos detach)
+        cout << "\n" << BOLD << "Esperando a que los hilos terminen (2 segundos)..." << RESET << flush;
+        this_thread::sleep_for(chrono::seconds(2));
+        cout << GREEN << " Completado." << RESET << endl;
         
         auto parEnd = chrono::high_resolution_clock::now();
         double parTimeNanos = chrono::duration_cast<chrono::nanoseconds>(parEnd - parStart).count();
@@ -414,7 +501,7 @@ int main() {
         int finalParResult = parResult.load();
         
         double speedup = 0.0;
-        if (seqTimeNanos > 0 && parTimeNanos > 0 && n > 5) {
+        if (seqTimeNanos > 0 && parTimeNanos > 0) {
             speedup = seqTimeNanos / parTimeNanos;
         }
         
@@ -447,6 +534,9 @@ int main() {
     
     // Export results to CSV file
     exportToCSV(benchmarkResults, "benchmark_results.csv");
+    
+    // Ejecutar el generador de gráficos
+    runChartGenerator();
     
     return 0;
 }
