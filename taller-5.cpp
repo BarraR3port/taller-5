@@ -437,7 +437,7 @@ int main() {
     // Ensure results directory exists
     ensureResultsDirectoryExists();
     
-    const int MAX_SIZE = 200; // Reducido para pruebas más rápidas
+    const int MAX_SIZE = 30; // Reducido para pruebas más rápidas
     
     cout << BOLD << "Sistema detectado:" << RESET << endl;
     cout << "Número de cores: " << getNumCores() << endl;
@@ -445,7 +445,7 @@ int main() {
     cout << "----------------------------------------" << endl;
     
     vector<int> sizes;
-    for(int i = 5; i <= MAX_SIZE; i++) {
+    for(int i = 2; i <= MAX_SIZE; i++) {
         sizes.push_back(i);
     }
     
@@ -463,7 +463,7 @@ int main() {
         auto matrix = generateCostMatrix(n);
         
         // Display matrix for small sizes
-        if (n <= 8) {
+        if (n <= 15) {
             displayMatrix(matrix);
         }
         
