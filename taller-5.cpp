@@ -12,6 +12,7 @@
 #include <fstream> // For CSV file output
 #include <sys/stat.h> // Para stat() en lugar de filesystem
 #include <cerrno> // Para códigos de error
+#include <csignal> // Para manejo de señales
 
 using namespace std;
 using namespace std::chrono;
@@ -26,6 +27,7 @@ atomic<chrono::steady_clock::time_point> searchStartTime;
 mutex progressMutex;
 string lastSequentialStatus;
 string lastParallelStatus;
+bool isInterrupted = false;
 
 // Directory for results
 const string RESULTS_DIR = "results";
@@ -42,6 +44,7 @@ struct BenchmarkResult {
     double speedup;
 };
 
+// Vector global para almacenar resultados
 vector<BenchmarkResult> benchmarkResults;
 
 // ANSI Color Codes
@@ -406,11 +409,35 @@ void runChartGenerator() {
     }
 }
 
+// Función para manejar la interrupción (Ctrl+C)
+void interruptHandler(int signal) {
+    cout << endl << BOLD RED << "¡Proceso interrumpido por el usuario! (señal " << signal << ")" << RESET << endl;
+    cout << YELLOW << "Intentando guardar los resultados parciales..." << RESET << endl;
+    
+    // Marcar como interrumpido para evitar procesamiento adicional
+    isInterrupted = true;
+    
+    // Exportar resultados parciales
+    if (!benchmarkResults.empty()) {
+        exportToCSV(benchmarkResults, "benchmark_results.csv");
+        runChartGenerator();
+    } else {
+        cout << RED << "No se encontraron resultados para guardar." << RESET << endl;
+    }
+    
+    cout << BOLD GREEN << "Saliendo..." << RESET << endl;
+    exit(0);
+}
+
 int main() {
+    // Configura los manejadores de señales
+    signal(SIGINT, interruptHandler);
+    signal(SIGTERM, interruptHandler);
+    
     // Ensure results directory exists
     ensureResultsDirectoryExists();
     
-    const int MAX_SIZE = 15; // Reducido para pruebas más rápidas
+    const int MAX_SIZE = 200; // Reducido para pruebas más rápidas
     
     cout << BOLD << "Sistema detectado:" << RESET << endl;
     cout << "Número de cores: " << getNumCores() << endl;
@@ -426,6 +453,11 @@ int main() {
     benchmarkResults.clear();
     
     for(int n : sizes) {
+        // Comprobar si se ha interrumpido el proceso
+        if (isInterrupted) {
+            break;
+        }
+        
         cout << "\n" << BOLD << "Probando matriz de " << n << "x" << n << ":" << RESET << "\n";
         
         auto matrix = generateCostMatrix(n);
@@ -474,6 +506,14 @@ int main() {
         cout << "  - Caminos podados: " << prunedPaths.load() << endl;
         cout << "  - Ultimo estado: " << lastSequentialStatus << endl;
         
+        // Guardar resultado parcial después de cada ejecución secuencial
+        benchmarkResults.push_back(seqBenchmark);
+        
+        // Comprobar si se ha interrumpido el proceso
+        if (isInterrupted) {
+            break;
+        }
+        
         // Parallel execution
         cout << "\nProcesando paralelo: ";
         cout.flush();
@@ -490,13 +530,16 @@ int main() {
         // Ejecutamos el backtracking paralelo
         parallelBacktracking(matrix, start, end, 0, parResult, parVisited);
         
-        // Esperamos un tiempo para que se completen los hilos (ya que usamos detach)
-        cout << "\n" << BOLD << "Esperando a que los hilos terminen (2 segundos)..." << RESET << flush;
-        this_thread::sleep_for(chrono::seconds(2));
-        cout << GREEN << " Completado." << RESET << endl;
-        
+        // Tomamos el tiempo de finalización antes de la espera
         auto parEnd = chrono::high_resolution_clock::now();
         double parTimeNanos = chrono::duration_cast<chrono::nanoseconds>(parEnd - parStart).count();
+        
+        // Ahora esperamos a que los hilos terminen (ya que usamos detach)
+        cout << "\n" << BOLD << "Esperando a que los hilos finalicen completamente..." << RESET << flush;
+        // Usamos un tiempo de espera variable según la complejidad (tamaño de la matriz)
+        int waitTimeMs = 200 + (n * 50); // Tiempo base + incremento por tamaño
+        this_thread::sleep_for(chrono::milliseconds(waitTimeMs));
+        cout << GREEN << " Completado." << RESET << endl;
         
         int finalParResult = parResult.load();
         
@@ -517,7 +560,6 @@ int main() {
         parBenchmark.speedup = speedup;
         
         // Add both results to the benchmark collection
-        benchmarkResults.push_back(seqBenchmark);
         benchmarkResults.push_back(parBenchmark);
         
         cout << BOLD CYAN << "Paralelo:" << RESET << endl;
@@ -530,13 +572,19 @@ int main() {
         cout << "  - Ultimo estado: " << lastParallelStatus << endl;
         
         cout << "----------------------------------------" << endl;
+        
+        // Export partial results after each matrix size
+        exportToCSV(benchmarkResults, "benchmark_results.csv");
     }
     
-    // Export results to CSV file
-    exportToCSV(benchmarkResults, "benchmark_results.csv");
-    
-    // Ejecutar el generador de gráficos
-    runChartGenerator();
+    // Si no ha sido interrumpido, exportar los resultados finales
+    if (!isInterrupted) {
+        // Export results to CSV file
+        exportToCSV(benchmarkResults, "benchmark_results.csv");
+        
+        // Ejecutar el generador de gráficos
+        runChartGenerator();
+    }
     
     return 0;
 }
