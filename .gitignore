@@ -1,0 +1,23 @@
+# Carpeta de resultados
+results/
+
+# Archivos compilados
+taller-5
+*.o
+*.out
+*.exe
+
+# Archivos temporales
+.DS_Store
+*.tmp
+*.temp
+
+# Entorno virtual de Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archivos CSV y PNG generados en la raíz (por si acaso)
+*.csv
+*.png 

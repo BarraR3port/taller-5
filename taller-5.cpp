@@ -9,9 +9,13 @@
 #include <atomic>
 #include <iomanip>
 #include <sstream>
+#include <fstream> // For CSV file output
+#include <filesystem> // For directory operations
+#include <system_error> // For error handling
 
 using namespace std;
 using namespace std::chrono;
+namespace fs = std::filesystem;
 
 // Variables globales
 atomic<int> totalThreads(0);
@@ -24,6 +28,23 @@ mutex progressMutex;
 string lastSequentialStatus;
 string lastParallelStatus;
 
+// Directory for results
+const string RESULTS_DIR = "results";
+
+// Structure to hold benchmark results
+struct BenchmarkResult {
+    int matrixSize;
+    string executionType;
+    int minDistance;
+    double timeNanos;
+    int visitedCells;
+    int prunedPaths;
+    int threadsCreated;
+    double speedup;
+};
+
+vector<BenchmarkResult> benchmarkResults;
+
 // ANSI Color Codes
 #define RESET   "\033[0m"
 #define BOLD    "\033[1m"
@@ -33,6 +54,18 @@ string lastParallelStatus;
 #define BLUE    "\033[34m"      /* Blue */
 #define MAGENTA "\033[35m"      /* Magenta */
 #define CYAN    "\033[36m"      /* Cyan */
+
+// Function to ensure the results directory exists
+void ensureResultsDirectoryExists() {
+    error_code ec;
+    if (!fs::exists(RESULTS_DIR, ec)) {
+        fs::create_directory(RESULTS_DIR, ec);
+        if (ec) {
+            cerr << "Error al crear el directorio " << RESULTS_DIR << ": " << ec.message() << endl;
+            exit(1);
+        }
+    }
+}
 
 // Function to display search status
 void showSearchStatus(int row, int col, int currentDist, int depth, int bestDist, bool isParallel, int matrixSize) {
@@ -253,8 +286,41 @@ double measureTime(Func func) {
     return duration_cast<nanoseconds>(stop - start).count();
 }
 
+// Function to export benchmark results to CSV file
+void exportToCSV(const vector<BenchmarkResult>& results, const string& filename) {
+    string fullPath = RESULTS_DIR + "/" + filename;
+    ofstream csvFile(fullPath);
+    
+    if (!csvFile.is_open()) {
+        cerr << "Error al abrir el archivo " << fullPath << " para escribir resultados." << endl;
+        return;
+    }
+    
+    // Write CSV header
+    csvFile << "Tamaño de Matriz,Tipo de Ejecución,Distancia Mínima,Tiempo (ns),Tiempo (s),Celdas Visitadas,Caminos Podados,Hilos Creados,Speedup\n";
+    
+    // Write each result
+    for (const auto& result : results) {
+        csvFile << result.matrixSize << ","
+                << result.executionType << ","
+                << (result.minDistance == numeric_limits<int>::max() ? "No encontrada" : to_string(result.minDistance)) << ","
+                << result.timeNanos << ","
+                << (result.timeNanos / 1000000000.0) << ","
+                << result.visitedCells << ","
+                << result.prunedPaths << ","
+                << (result.executionType == "Secuencial" ? "N/A" : to_string(result.threadsCreated)) << ","
+                << (result.executionType == "Secuencial" ? "N/A" : to_string(result.speedup)) << "\n";
+    }
+    
+    csvFile.close();
+    cout << BOLD << "Resultados exportados a '" << fullPath << "'" << RESET << endl;
+}
+
 int main() {
-    const int MAX_SIZE = 500;
+    // Ensure results directory exists
+    ensureResultsDirectoryExists();
+    
+    const int MAX_SIZE = 10;
     
     cout << BOLD << "Sistema detectado:" << RESET << endl;
     cout << "Número de cores: " << getNumCores() << endl;
@@ -266,13 +332,18 @@ int main() {
         sizes.push_back(i);
     }
     
+    // Clear the benchmark results container
+    benchmarkResults.clear();
+    
     for(int n : sizes) {
         cout << "\n" << BOLD << "Probando matriz de " << n << "x" << n << ":" << RESET << "\n";
         
         auto matrix = generateCostMatrix(n);
         
         // Display matrix for small sizes
-        displayMatrix(matrix);
+        if (n <= 10) {
+            displayMatrix(matrix);
+        }
         
         int start = 0;
         int end = n - 1;
@@ -294,6 +365,17 @@ int main() {
         sequentialBacktracking(matrix, start, end, 0, seqResult, seqVisited);
         auto seqEnd = chrono::high_resolution_clock::now();
         double seqTimeNanos = chrono::duration_cast<chrono::nanoseconds>(seqEnd - seqStart).count();
+
+        // Store sequential benchmark results
+        BenchmarkResult seqBenchmark;
+        seqBenchmark.matrixSize = n;
+        seqBenchmark.executionType = "Secuencial";
+        seqBenchmark.minDistance = seqResult;
+        seqBenchmark.timeNanos = seqTimeNanos;
+        seqBenchmark.visitedCells = visitedCells.load();
+        seqBenchmark.prunedPaths = prunedPaths.load();
+        seqBenchmark.threadsCreated = 1; // Main thread only
+        seqBenchmark.speedup = 1.0; // Reference speedup
 
         cout << "\n" << BOLD YELLOW << "Secuencial:" << RESET << endl;
         cout << "  - Distancia minima: " << (seqResult == numeric_limits<int>::max() ? "No encontrada" : to_string(seqResult)) << endl;
@@ -336,6 +418,21 @@ int main() {
             speedup = seqTimeNanos / parTimeNanos;
         }
         
+        // Store parallel benchmark results
+        BenchmarkResult parBenchmark;
+        parBenchmark.matrixSize = n;
+        parBenchmark.executionType = "Paralelo";
+        parBenchmark.minDistance = finalParResult;
+        parBenchmark.timeNanos = parTimeNanos;
+        parBenchmark.visitedCells = visitedCells.load();
+        parBenchmark.prunedPaths = prunedPaths.load();
+        parBenchmark.threadsCreated = totalThreads.load();
+        parBenchmark.speedup = speedup;
+        
+        // Add both results to the benchmark collection
+        benchmarkResults.push_back(seqBenchmark);
+        benchmarkResults.push_back(parBenchmark);
+        
         cout << BOLD CYAN << "Paralelo:" << RESET << endl;
         cout << "  - Distancia minima: " << (finalParResult == numeric_limits<int>::max() ? "No encontrada" : to_string(finalParResult)) << endl;
         cout << "  - Tiempo: " << formatTime(parTimeNanos) << endl;
@@ -347,6 +444,9 @@ int main() {
         
         cout << "----------------------------------------" << endl;
     }
+    
+    // Export results to CSV file
+    exportToCSV(benchmarkResults, "benchmark_results.csv");
     
     return 0;
 }
