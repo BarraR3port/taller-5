@@ -28,73 +28,30 @@ if ! command -v g++ &> /dev/null; then
 fi
 echo -e "${GREEN}✅ Compilador g++ encontrado.${NC}"
 
-# Verificar Python
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}❌ Error: Python 3 no está instalado. Por favor, instala Python 3.${NC}"
+# Check for Homebrew
+if ! command -v brew &> /dev/null; then
+    echo "❌ Homebrew is not installed. Please install Homebrew from https://brew.sh/"
     exit 1
 fi
-echo -e "${GREEN}✅ Python 3 encontrado.${NC}"
+echo "✅ Homebrew found."
+
+echo "Installing GCC with OpenMP support and libomp..."
+brew install gcc libomp
 
 # Crear carpeta de resultados
 echo -e "\n${CYAN}[2/5] Preparando carpeta de resultados...${NC}"
 mkdir -p "$RESULTS_DIR"
 echo -e "${GREEN}✅ Carpeta de resultados configurada.${NC}"
 
-# Crear y configurar entorno virtual de Python
-echo -e "\n${CYAN}[3/5] Configurando entorno virtual Python...${NC}"
+# Compile the program
+echo "Compiling program..."
+g++-14 -fopenmp -std=c++17 taller-5.cpp -o taller-5
 
-# Verificar si ya existe el entorno virtual
-if [ ! -d "$VENV_DIR" ]; then
-    echo "Creando entorno virtual Python en $VENV_DIR..."
-    python3 -m venv "$VENV_DIR"
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ Error al crear el entorno virtual Python.${NC}"
-        exit 1
-    fi
-else
-    echo "Entorno virtual ya existe, utilizándolo..."
-fi
-
-# Activar entorno virtual
-echo "Activando entorno virtual..."
-source "$VENV_DIR/bin/activate"
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ Error al activar el entorno virtual Python.${NC}"
-    exit 1
-fi
-
-# Instalar dependencias en el entorno virtual
-echo "Instalando dependencias de Python en el entorno virtual..."
-pip install pandas matplotlib seaborn
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ Error al instalar las dependencias de Python.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✅ Entorno virtual configurado correctamente con todas las dependencias.${NC}"
-
-# Compilar el programa
-echo -e "\n${CYAN}[4/5] Compilando el programa...${NC}"
-if g++ -std=c++11 taller-5.cpp -o taller-5 -pthread; then
-    echo -e "${GREEN}✅ Compilación exitosa.${NC}"
-else
-    echo -e "${RED}❌ Error durante la compilación.${NC}"
-    deactivate # Desactivar entorno virtual antes de salir
-    exit 1
-fi
-
-# Ejecutar el programa
-echo -e "\n${CYAN}[5/5] Ejecutando el programa...${NC}"
-echo -e "📊 Este proceso puede tardar varios minutos para matrices grandes."
-echo -e "📊 El programa mostrará el progreso en tiempo real.\n"
-
+# Run the program
+echo "Running program..."
 ./taller-5
 
-# Generar gráficos
-echo -e "\n${CYAN}Generando gráficos...${NC}"
-python generate_charts.py
-
-# Desactivar entorno virtual
-deactivate
+echo "Program completed."
 
 # Mensaje final
 echo -e "\n${GREEN}==================================================${NC}"
